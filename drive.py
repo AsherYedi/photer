@@ -7,6 +7,7 @@ Streamlit Secrets (or environment variables for local dev). See
 README.md for setup instructions.
 """
 import os
+import re
 from typing import Dict, List, Optional
 
 import streamlit as st
@@ -74,15 +75,23 @@ def is_configured() -> bool:
     return bool(config["web"]["client_id"] and config["web"]["client_secret"])
 
 
-def get_authorization_url() -> str:
-    """Build the Google consent-screen URL the user clicks to sign in."""
+def get_authorization_url(state: Optional[str] = None) -> str:
+    """Build the Google consent-screen URL the user clicks to sign in.
+
+    `state` round-trips through Google and comes back on the redirect —
+    used here to carry the pasted folder ID across the OAuth hop, since
+    a full-page redirect to Google and back can lose session_state.
+    """
     config, redirect_uri = _get_client_config()
     flow = Flow.from_client_config(config, scopes=SCOPES, redirect_uri=redirect_uri)
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
-    )
+    kwargs = {
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+    }
+    if state:
+        kwargs["state"] = state
+    auth_url, _ = flow.authorization_url(**kwargs)
     return auth_url
 
 
@@ -124,20 +133,40 @@ def build_service(creds: Credentials):
     return build("drive", "v3", credentials=creds)
 
 
-def list_folders(service, query: Optional[str] = None) -> List[Dict]:
-    """List folders in the user's Drive, optionally filtered by name."""
-    q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    if query:
-        safe_query = query.replace("'", "\\'")
-        q += f" and name contains '{safe_query}'"
-    result = service.files().list(
-        q=q,
-        spaces="drive",
-        fields="files(id, name)",
-        pageSize=50,
-        orderBy="name",
-    ).execute()
-    return result.get("files", [])
+# Matches a bare Drive file/folder ID (no slashes, Drive IDs run 25+ chars).
+_BARE_ID_PATTERN = re.compile(r"^[-\w]{15,}$")
+
+
+def extract_folder_id(text: str) -> Optional[str]:
+    """Pull a Drive folder ID out of a pasted folder link.
+
+    Accepts full share links like
+    https://drive.google.com/drive/folders/<id>?usp=sharing,
+    the u/0/ variant, an ?id=<id> style link, or a bare folder ID.
+    Returns None if nothing that looks like a folder ID is found.
+    """
+    if not text:
+        return None
+    text = text.strip()
+
+    match = re.search(r"/folders/([-\w]+)", text)
+    if match:
+        return match.group(1)
+
+    match = re.search(r"[?&]id=([-\w]+)", text)
+    if match:
+        return match.group(1)
+
+    if _BARE_ID_PATTERN.match(text):
+        return text
+
+    return None
+
+
+def get_folder_name(service, folder_id: str) -> str:
+    """Look up a folder's display name, for showing in the results header."""
+    meta = service.files().get(fileId=folder_id, fields="name").execute()
+    return meta.get("name", folder_id)
 
 
 def list_images_in_folder(service, folder_id: str) -> List[Dict]:
@@ -151,7 +180,7 @@ def list_images_in_folder(service, folder_id: str) -> List[Dict]:
         result = service.files().list(
             q=q,
             spaces="drive",
-            fields="nextPageToken, files(id, name, mimeType, size)",
+            fields="nextPageToken, files(id, name, mimeType, size, webViewLink)",
             pageSize=100,
             pageToken=page_token,
         ).execute()
